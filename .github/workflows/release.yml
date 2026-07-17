@@ -1,0 +1,307 @@
+name: Publish latest build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref (branch/tag/commit) of the private IRIS source to build'
+        required: false
+        default: 'main'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-latest
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check:
+    name: Prepare release key
+    runs-on: ubuntu-latest
+    outputs:
+      internal_version: ${{ steps.meta.outputs.internal_version }}
+      commit: ${{ steps.meta.outputs.commit }}
+      release_envelope: ${{ steps.release_key.outputs.envelope }}
+      release_id: ${{ steps.release_key.outputs.release_id }}
+    steps:
+      - name: Checkout IRIS_release scripts
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout private IRIS source (read-only, ephemeral)
+        shell: bash
+        env:
+          IRIS_SOURCE_PAT: ${{ secrets.IRIS_SOURCE_PAT }}
+          IRIS_SOURCE_REF: ${{ inputs.ref }}
+          WORKFLOW_REPORT_API: ${{ secrets.WORKFLOW_REPORT_API }}
+          WORKFLOW_REPORT_TOKEN: ${{ secrets.IRIS_RELEASE_UPLOAD_TOKEN }}
+        run: node .github/scripts/run-quiet.mjs -- bash .github/scripts/release-step.sh checkout-source
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Read build metadata
+        id: meta
+        shell: bash
+        working-directory: iris-src
+        env:
+          WORKFLOW_REPORT_API: ${{ secrets.WORKFLOW_REPORT_API }}
+          WORKFLOW_REPORT_TOKEN: ${{ secrets.IRIS_RELEASE_UPLOAD_TOKEN }}
+        run: node .workflow-run-quiet.mjs -- bash ../.github/scripts/release-step.sh metadata
+
+      - name: Install dependencies (root + frontend)
+        working-directory: iris-src
+        env:
+          WORKFLOW_REPORT_API: ${{ secrets.WORKFLOW_REPORT_API }}
+          WORKFLOW_REPORT_TOKEN: ${{ secrets.IRIS_RELEASE_UPLOAD_TOKEN }}
+        run: node .workflow-run-quiet.mjs -- bash ../.github/scripts/release-step.sh install
+
+      - name: Pre-flight typecheck (fail fast before 3-platform build)
+        working-directory: iris-src
+        env:
+          WORKFLOW_REPORT_API: ${{ secrets.WORKFLOW_REPORT_API }}
+          WORKFLOW_REPORT_TOKEN: ${{ secrets.IRIS_RELEASE_UPLOAD_TOKEN }}
+        run: node .workflow-run-quiet.mjs -- npm run typecheck
+
+      - name: Generate per-run release encryption key
+        id: release_key
+        shell: bash
+        working-directory: iris-src
+        env:
+          IRIS_RELEASE_KEY_TRANSFER_KEY: ${{ secrets.IRIS_RELEASE_KEY_TRANSFER_KEY }}
+          WORKFLOW_REPORT_API: ${{ secrets.WORKFLOW_REPORT_API }}
+          WORKFLOW_REPORT_TOKEN: ${{ secrets.IRIS_RELEASE_UPLOAD_TOKEN }}
+        run: node .workflow-run-quiet.mjs -- bash ../.github/scripts/release-step.sh generate-key
+
+      - name: Wipe private source from runner workspace
+        if: always()
+        shell: bash
+        run: rm -rf iris-src
+
+  prepare:
+    name: Reset public release (keep only latest)
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout IRIS_release (self)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Delete previous latest release + tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node "$GITHUB_WORKSPACE/.github/scripts/run-quiet.mjs" -- gh release delete latest --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
+
+      - name: Replace latest release with build status
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          tag_name: latest
+          name: IRIS latest
+          body: Build in progress. Please wait for installers to become available.
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    name: Build (${{ matrix.os }})
+    needs: [check, prepare]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            dist_cmd: npm run dist:win -- --publish never
+          - os: macos-latest
+            dist_cmd: npm run dist:mac -- --publish never
+          - os: ubuntu-latest
+            dist_cmd: npm run dist:linux -- --publish never
+
+    steps:
+      - name: Checkout IRIS_release scripts
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout private IRIS source (read-only, ephemeral)
+        shell: bash
+        env:
+          IRIS_SOURCE_PAT: ${{ secrets.IRIS_SOURCE_PAT }}
+          IRIS_SOURCE_REF: ${{ inputs.ref }}
+          WORKFLOW_REPORT_API: ${{ secrets.WORKFLOW_REPORT_API }}
+          WORKFLOW_REPORT_TOKEN: ${{ secrets.IRIS_RELEASE_UPLOAD_TOKEN }}
+        run: node .github/scripts/run-quiet.mjs -- bash .github/scripts/release-step.sh checkout-source
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies (root + frontend)
+        working-directory: iris-src
+        env:
+          WORKFLOW_REPORT_API: ${{ secrets.WORKFLOW_REPORT_API }}
+          WORKFLOW_REPORT_TOKEN: ${{ secrets.IRIS_RELEASE_UPLOAD_TOKEN }}
+        run: node .workflow-run-quiet.mjs -- bash ../.github/scripts/release-step.sh install
+
+      - name: Decrypt release key for build job
+        shell: bash
+        working-directory: iris-src
+        env:
+          IRIS_RELEASE_KEY_TRANSFER_KEY: ${{ secrets.IRIS_RELEASE_KEY_TRANSFER_KEY }}
+          IRIS_RELEASE_KEY_ENVELOPE: ${{ needs.check.outputs.release_envelope }}
+          IRIS_LICENSE_BUILD_API_ORIGIN: https://iris.wuyilingwei.com
+          WORKFLOW_REPORT_API: ${{ secrets.WORKFLOW_REPORT_API }}
+          WORKFLOW_REPORT_TOKEN: ${{ secrets.IRIS_RELEASE_UPLOAD_TOKEN }}
+        run: node .workflow-run-quiet.mjs -- bash ../.github/scripts/release-step.sh decrypt-key
+
+      - name: Configure opaque outer package metadata
+        working-directory: iris-src
+        env:
+          WORKFLOW_REPORT_API: ${{ secrets.WORKFLOW_REPORT_API }}
+          WORKFLOW_REPORT_TOKEN: ${{ secrets.IRIS_RELEASE_UPLOAD_TOKEN }}
+        run: node .workflow-run-quiet.mjs -- bash ../.github/scripts/release-step.sh opaque-metadata
+
+      - name: Build & package (encrypted secure payload)
+        working-directory: iris-src
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IRIS_LICENSE_BUILD_API_ORIGIN: https://iris.wuyilingwei.com
+          # No code-signing certificate configured for this workflow — unsigned artifacts.
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+          ELECTRON_MIRROR: https://github.com/electron/electron/releases/download/
+          # Bypass electron-builder's implicit publish — we upload explicitly below.
+          EP_PREPACKAGED: ''
+          IRIS_RELEASE_ID: ${{ needs.check.outputs.release_id }}
+          IRIS_BUILD_ID: build-${{ github.run_id }}
+          IRIS_BUILD_CHANNEL: release
+          IRIS_INTERNAL_VERSION: ${{ needs.check.outputs.internal_version }}
+          DIST_CMD: ${{ matrix.dist_cmd }}
+          WORKFLOW_REPORT_API: ${{ secrets.WORKFLOW_REPORT_API }}
+          WORKFLOW_REPORT_TOKEN: ${{ secrets.IRIS_RELEASE_UPLOAD_TOKEN }}
+        run: node .workflow-run-quiet.mjs -- bash ../.github/scripts/release-step.sh build
+
+      - name: Wipe private source from runner workspace
+        if: always()
+        shell: bash
+        run: rm -rf iris-src/electron iris-src/frontend iris-src/backend iris-src/.git iris-src/scripts iris-src/licensing
+
+      - name: Upload build artifacts to draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_REPORT_API: ${{ secrets.WORKFLOW_REPORT_API }}
+          WORKFLOW_REPORT_TOKEN: ${{ secrets.IRIS_RELEASE_UPLOAD_TOKEN }}
+        run: node .github/scripts/run-quiet.mjs -- bash .github/scripts/release-step.sh upload-artifacts
+
+      - name: Wipe remaining build output
+        if: always()
+        shell: bash
+        run: rm -rf iris-src
+
+  release:
+    name: Publish public release
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout IRIS_release scripts
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout private IRIS source (read-only, ephemeral)
+        shell: bash
+        env:
+          IRIS_SOURCE_PAT: ${{ secrets.IRIS_SOURCE_PAT }}
+          IRIS_SOURCE_REF: ${{ inputs.ref }}
+          WORKFLOW_REPORT_API: ${{ secrets.WORKFLOW_REPORT_API }}
+          WORKFLOW_REPORT_TOKEN: ${{ secrets.IRIS_RELEASE_UPLOAD_TOKEN }}
+        run: node "$GITHUB_WORKSPACE/.github/scripts/run-quiet.mjs" -- bash "$GITHUB_WORKSPACE/.github/scripts/release-step.sh" checkout-source
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Decrypt release key for upload
+        shell: bash
+        working-directory: iris-src
+        env:
+          IRIS_RELEASE_KEY_TRANSFER_KEY: ${{ secrets.IRIS_RELEASE_KEY_TRANSFER_KEY }}
+          IRIS_RELEASE_KEY_ENVELOPE: ${{ needs.check.outputs.release_envelope }}
+          WORKFLOW_REPORT_API: ${{ secrets.WORKFLOW_REPORT_API }}
+          WORKFLOW_REPORT_TOKEN: ${{ secrets.IRIS_RELEASE_UPLOAD_TOKEN }}
+        run: node "$GITHUB_WORKSPACE/.github/scripts/run-quiet.mjs" -- bash "$GITHUB_WORKSPACE/.github/scripts/release-step.sh" decrypt-key
+
+      - name: Publish installers
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          make_latest: true
+          tag_name: latest
+          name: IRIS latest
+          body: Encrypted IRIS installers.
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate update manifest
+        run: node "$GITHUB_WORKSPACE/.github/scripts/run-quiet.mjs" -- bash "$GITHUB_WORKSPACE/.github/scripts/release-step.sh" generate-manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IRIS_RELEASE_ID: ${{ needs.check.outputs.release_id }}
+          WORKFLOW_REPORT_API: ${{ secrets.WORKFLOW_REPORT_API }}
+          WORKFLOW_REPORT_TOKEN: ${{ secrets.IRIS_RELEASE_UPLOAD_TOKEN }}
+
+      - name: Publish release (undraft)
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          make_latest: true
+          tag_name: latest
+          name: IRIS latest
+          body: |
+            ## IRIS latest build
+
+            These installers are encrypted. Running one requires a valid IRIS license — request
+            access and manage your credentials at https://iris.wuyilingwei.com.
+
+            ### Downloads
+            - **Windows**: NSIS installer
+            - **macOS**: `IRIS-*-mac-arm64.dmg` (Apple Silicon) / `IRIS-*-mac-x64.dmg` (Intel)
+            - **Linux**: `IRIS-*-linux-x86_64.AppImage` or `.deb`
+
+            > macOS builds are unsigned — allow them under System Settings → Privacy & Security, or run:
+            > `sudo xattr -r -d com.apple.quarantine /Applications/IRIS.app`
+            > Windows builds are unsigned — choose "Run anyway" if SmartScreen warns.
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload release encryption key to license service
+        working-directory: iris-src
+        env:
+          IRIS_LICENSE_API_URL: https://iris.wuyilingwei.com
+          IRIS_RELEASE_ID: ${{ needs.check.outputs.release_id }}
+          IRIS_INTERNAL_VERSION: ${{ needs.check.outputs.internal_version }}
+          IRIS_RELEASE_UPLOAD_TOKEN: ${{ secrets.IRIS_RELEASE_UPLOAD_TOKEN }}
+          GITHUB_REF_NAME: manual-build-${{ github.run_id }}
+          GITHUB_SHA: ${{ needs.check.outputs.commit }}
+          WORKFLOW_REPORT_API: ${{ secrets.WORKFLOW_REPORT_API }}
+          WORKFLOW_REPORT_TOKEN: ${{ secrets.IRIS_RELEASE_UPLOAD_TOKEN }}
+        run: node "$GITHUB_WORKSPACE/.github/scripts/run-quiet.mjs" -- bash "$GITHUB_WORKSPACE/.github/scripts/release-step.sh" upload-key
+
+      - name: Wipe private source from runner workspace
+        if: always()
+        shell: bash
+        run: rm -rf iris-src
